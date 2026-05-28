@@ -645,4 +645,6 @@ async def say(ctx, *, message):
 # RUN BOT
 # ============================
 
-bot.run("Bot_Token")
+import os
+bot.run(os.getenv("TOKEN"))
+
