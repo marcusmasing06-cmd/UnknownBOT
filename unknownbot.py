@@ -6,6 +6,7 @@ import time
 import random
 import asyncio
 from PIL import Image, ImageDraw, ImageFont
+import yt_dlp
 
 # ============================
 # INTENTS
@@ -642,9 +643,312 @@ async def say(ctx, *, message):
 
 
 # ============================
+# MUSIC SYSTEM
+# ============================
+
+music_queue = {}
+autoplay_enabled = {}
+always_on = {}
+last_track_info = {}  # store last played info per guild
+
+YDL_OPTIONS = {
+    "format": "bestaudio/best",
+    "quiet": True,
+    "default_search": "ytsearch",
+    "extract_flat": False,
+}
+
+FFMPEG_OPTIONS = {
+    "options": "-vn"
+}
+
+
+def is_dj(ctx):
+    return any(r.name.lower() == "dj" for r in ctx.author.roles) or ctx.author.guild_permissions.administrator
+
+
+def add_to_queue(guild_id, url):
+    if guild_id not in music_queue:
+        music_queue[guild_id] = []
+    music_queue[guild_id].append(url)
+
+
+async def play_next(ctx):
+    guild_id = ctx.guild.id
+    vc = ctx.voice_client
+
+    if guild_id not in music_queue or len(music_queue[guild_id]) == 0:
+        if autoplay_enabled.get(guild_id, False):
+            await autoplay(ctx)
+        else:
+            if not always_on.get(guild_id, False):
+                await ctx.send("📭 Queue finished.")
+            return
+
+    if guild_id not in music_queue or len(music_queue[guild_id]) == 0:
+        return
+
+    url = music_queue[guild_id].pop(0)
+
+    with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+        info = ydl.extract_info(url, download=False)
+        if "entries" in info:
+            info = info["entries"][0]
+        audio_url = info["url"]
+        title = info.get("title", "Unknown Title")
+        description = info.get("description", "")
+
+    last_track_info[guild_id] = {
+        "title": title,
+        "url": url,
+        "description": description
+    }
+
+    await ctx.send(f"🎶 Now playing: **{title}**")
+
+    vc.play(
+        discord.FFmpegPCMAudio(audio_url, **FFMPEG_OPTIONS),
+        after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+    )
+
+
+async def autoplay(ctx):
+    guild_id = ctx.guild.id
+    vc = ctx.voice_client
+
+    if not vc:
+        return
+
+    with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+        results = ydl.extract_info("ytsearch:recommended music", download=False)
+        entry = results["entries"][0]
+        url = entry["webpage_url"]
+        title = entry["title"]
+        description = entry.get("description", "")
+
+    last_track_info[guild_id] = {
+        "title": title,
+        "url": url,
+        "description": description
+    }
+
+    await ctx.send(f"🎧 Autoplay: **{title}**")
+
+    vc.play(
+        discord.FFmpegPCMAudio(entry["url"], **FFMPEG_OPTIONS),
+        after=lambda e: asyncio.run_coroutine_threadsafe(autoplay(ctx), bot.loop)
+    )
+
+
+@bot.command()
+async def play(ctx, *, search):
+    if ctx.author.voice is None:
+        return await ctx.send("❌ Join a voice channel first.")
+
+    channel = ctx.author.voice.channel
+
+    if ctx.voice_client is None:
+        await channel.connect()
+
+    guild_id = ctx.guild.id
+
+    with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
+        info = ydl.extract_info(search, download=False)
+        if "entries" in info:
+            info = info["entries"][0]
+        url = info["webpage_url"]
+        title = info.get("title", "Unknown Title")
+
+    add_to_queue(guild_id, url)
+
+    if not ctx.voice_client.is_playing():
+        await play_next(ctx)
+    else:
+        await ctx.send(f"🎵 Added to queue: **{title}**")
+
+
+@bot.command()
+async def queue(ctx):
+    guild_id = ctx.guild.id
+
+    if guild_id not in music_queue or len(music_queue[guild_id]) == 0:
+        return await ctx.send("📭 Queue is empty.")
+
+    msg = "**🎶 Current Queue:**\n"
+    for i, url in enumerate(music_queue[guild_id], start=1):
+        msg += f"{i}. {url}\n"
+
+    await ctx.send(msg)
+
+
+@bot.command()
+async def skip(ctx):
+    if not is_dj(ctx):
+        return await ctx.send("❌ You need the **DJ** role or admin to use this.")
+
+    if ctx.voice_client is None:
+        return await ctx.send("❌ I'm not playing anything.")
+
+    ctx.voice_client.stop()
+    await ctx.send("⏭ Skipped.")
+
+
+@bot.command()
+async def stop(ctx):
+    if not is_dj(ctx):
+        return await ctx.send("❌ You need the **DJ** role or admin to use this.")
+
+    guild_id = ctx.guild.id
+    music_queue[guild_id] = []
+
+    if ctx.voice_client:
+        ctx.voice_client.stop()
+
+    await ctx.send("⏹ Stopped and cleared queue.")
+
+
+@bot.command()
+async def leave(ctx):
+    if ctx.voice_client:
+        await ctx.voice_client.disconnect()
+        await ctx.send("👋 Left the voice channel.")
+
+
+@bot.command()
+async def pause(ctx):
+    if not is_dj(ctx):
+        return await ctx.send("❌ You need the **DJ** role or admin to use this.")
+
+    if ctx.voice_client and ctx.voice_client.is_playing():
+        ctx.voice_client.pause()
+        await ctx.send("⏸ Paused.")
+
+
+@bot.command()
+async def resume(ctx):
+    if not is_dj(ctx):
+        return await ctx.send("❌ You need the **DJ** role or admin to use this.")
+
+    if ctx.voice_client and ctx.voice_client.is_paused():
+        ctx.voice_client.resume()
+        await ctx.send("▶ Resumed.")
+
+
+@bot.command()
+async def volume(ctx, vol: int):
+    if not is_dj(ctx):
+        return await ctx.send("❌ You need the **DJ** role or admin to use this.")
+
+    if ctx.voice_client is None or ctx.voice_client.source is None:
+        return await ctx.send("❌ I'm not playing anything.")
+
+    if vol < 0 or vol > 200:
+        return await ctx.send("Volume must be between 0 and 200.")
+
+    if not hasattr(ctx.voice_client.source, "volume"):
+        ctx.voice_client.source = discord.PCMVolumeTransformer(ctx.voice_client.source)
+
+    ctx.voice_client.source.volume = vol / 100
+    await ctx.send(f"🔊 Volume set to **{vol}%**")
+
+
+@bot.command()
+async def autoplaymode(ctx):
+    guild_id = ctx.guild.id
+    autoplay_enabled[guild_id] = not autoplay_enabled.get(guild_id, False)
+
+    state = "ON" if autoplay_enabled[guild_id] else "OFF"
+    await ctx.send(f"🎧 Autoplay is now **{state}**")
+
+
+@bot.command()
+async def alwaysonmode(ctx):
+    guild_id = ctx.guild.id
+    always_on[guild_id] = not always_on.get(guild_id, False)
+
+    state = "ON" if always_on[guild_id] else "OFF"
+    await ctx.send(f"📡 24/7 mode is now **{state}**")
+
+
+@bot.command()
+async def lyrics(ctx):
+    guild_id = ctx.guild.id
+    info = last_track_info.get(guild_id)
+
+    if not info:
+        return await ctx.send("❌ No track info available yet.")
+
+    description = info.get("description", "")
+    if not description:
+        return await ctx.send("❌ No lyrics/description found for this track.")
+
+    if len(description) > 1900:
+        description = description[:1900] + "\n...\n(lyrics truncated)"
+
+    embed = discord.Embed(
+        title=f"Lyrics / Description for: {info['title']}",
+        description=description,
+        color=0x00ff99
+    )
+    await ctx.send(embed=embed)
+
+
+# ============================
+# MUSIC CONTROL PANEL (BUTTONS)
+# ============================
+
+class MusicControlView(discord.ui.View):
+    def __init__(self, ctx):
+        super().__init__(timeout=60)
+        self.ctx = ctx
+
+    @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary)
+    async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.ctx.author:
+            return await interaction.response.send_message("This panel is not for you.", ephemeral=True)
+        if self.ctx.voice_client and self.ctx.voice_client.is_playing():
+            self.ctx.voice_client.pause()
+            await interaction.response.send_message("⏸ Paused.", ephemeral=True)
+
+    @discord.ui.button(label="Resume", style=discord.ButtonStyle.success)
+    async def resume_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.ctx.author:
+            return await interaction.response.send_message("This panel is not for you.", ephemeral=True)
+        if self.ctx.voice_client and self.ctx.voice_client.is_paused():
+            self.ctx.voice_client.resume()
+            await interaction.response.send_message("▶ Resumed.", ephemeral=True)
+
+    @discord.ui.button(label="Skip", style=discord.ButtonStyle.primary)
+    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.ctx.author:
+            return await interaction.response.send_message("This panel is not for you.", ephemeral=True)
+        if self.ctx.voice_client:
+            self.ctx.voice_client.stop()
+            await interaction.response.send_message("⏭ Skipped.", ephemeral=True)
+
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user != self.ctx.author:
+            return await interaction.response.send_message("This panel is not for you.", ephemeral=True)
+        guild_id = self.ctx.guild.id
+        music_queue[guild_id] = []
+        if self.ctx.voice_client:
+            self.ctx.voice_client.stop()
+        await interaction.response.send_message("⏹ Stopped and cleared queue.", ephemeral=True)
+
+
+@bot.command()
+async def musicpanel(ctx):
+    if ctx.voice_client is None:
+        return await ctx.send("❌ I'm not in a voice channel.")
+    view = MusicControlView(ctx)
+    await ctx.send("🎛 Music Control Panel", view=view)
+
+
+# ============================
 # RUN BOT
 # ============================
 
-import os
 bot.run(os.getenv("TOKEN"))
+
 
